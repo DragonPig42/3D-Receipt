@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Document metadata for browser rendering -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Receipt UI - Verlet Paper</title>
+    <style>
+      /* CSS variables for consistent theming */
+      :root {
+        --bg: #ffffff; /* Page background */
+        --paper: #fffefb; /* Receipt paper tint */
+        --ink: #2b2b2b; /* Receipt text color */
+        --accent: #d23d2a; /* Accent red */
+      }
+      /* Make the page full-bleed and scrollable */
+      html,
+      body {
+        margin: 0; /* Remove default margin */
+        padding: 0; /* Remove default padding */
+        width: 100%; /* Full width */
+        height: 100%; /* Full height */
+        overflow-y: auto; /* Allow scrolling */
+        background: var(--bg); /* White background */
+        font-family: "Georgia", "Times New Roman", serif; /* Warm print-like font */
+        color: var(--ink); /* Default text color */
+        padding-bottom: 30vh; /* Extra bottom space */
+      }
+      /* WebGL container fills the viewport */
+      #app {
+        position: fixed; /* Stick to viewport */
+        inset: 0; /* Full-screen */
+        height: 100vh; /* Lock height */
+      }
+      /* Instruction box in the top-left */
+      .hint {
+        position: fixed; /* Always visible */
+        left: 20px; /* Offset from left */
+        top: 16px; /* Offset from top */
+        padding: 10px 14px; /* Inner spacing */
+        background: #ffffff; /* White card */
+        border: 1px solid rgba(0, 0, 0, 0.08); /* Soft border */
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08); /* Soft shadow */
+        border-radius: 10px; /* Rounded corners */
+        font-size: 13px; /* Small UI text */
+        line-height: 1.4; /* Readable line height */
+        backdrop-filter: blur(4px); /* Subtle glass effect */
+        max-width: 240px; /* Constrain width */
+      }
+      /* Accent for the "Left click" label */
+      .hint b {
+        color: var(--accent); /* Red highlight */
+      }
+      /* Spacer to make the page scroll */
+      .scroll-space {
+        height: 320vh; /* Long scroll area */
+      }
+    </style>
+  </head>
+  <body>
+    <!-- WebGL mount point -->
+    <div id="app"></div>
+    <!-- User hint panel -->
+    <div class="hint">
+      <b>Left click</b> to grab and drag.<br />
+      Pull, bend, and fold the receipt. Top edge stays straight.
+    </div>
+
+    <!-- Scroll spacer -->
+    <div class="scroll-space"></div>
+
+    <!-- Three.js from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js"></script>
+    <script>
+      (() => {
+        // Grab the container element
+        const container = document.getElementById("app");
+
+        // Create the scene
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xffffff); // Pure white background
+
+        // Create the camera
+        const camera = new THREE.PerspectiveCamera(
+          35, // Field of view
+          window.innerWidth / window.innerHeight, // Aspect ratio
+          0.1, // Near clipping plane
+          50 // Far clipping plane
+        );
+        camera.position.set(0, 0, 4.2); // Initial camera position
+
+        // Create the renderer
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Keep perf reasonable
+        renderer.setSize(window.innerWidth, window.innerHeight); // Match viewport
+        renderer.shadowMap.enabled = false; // Disable shadows for pure white background
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Unused since shadows are off
+        renderer.setClearColor(0xffffff, 1); // Force pure white clear color
+        container.appendChild(renderer.domElement); // Add canvas to page
+
+        // Global ambient light
+        const ambient = new THREE.AmbientLight(0xffffff, 0.9);
+        scene.add(ambient);
+
+        // Key light
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        keyLight.position.set(1.2, 2.2, 2);
+        keyLight.castShadow = false; // Keep background clean
+        keyLight.shadow.mapSize.set(1024, 1024);
+        keyLight.shadow.camera.near = 0.5;
+        keyLight.shadow.camera.far = 10;
+        keyLight.shadow.camera.left = -2;
+        keyLight.shadow.camera.right = 2;
+        keyLight.shadow.camera.top = 2;
+        keyLight.shadow.camera.bottom = -2;
+        scene.add(keyLight);
+
+        // Rim light to lift edges
+        const rimLight = new THREE.DirectionalLight(0xffffff, 0.55);
+        rimLight.position.set(-2, 1.6, 1.5);
+        scene.add(rimLight);
+
+        // Backdrop plane (pure white, unlit)
+        const backdropGeom = new THREE.PlaneGeometry(8, 6);
+        const backdropMat = new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          roughness: 0.9,
+          metalness: 0,
+        });
+        const backdrop = new THREE.Mesh(backdropGeom, backdropMat);
+        backdrop.position.set(0, 0, -1.2);
+        backdrop.receiveShadow = false;
+        scene.add(backdrop);
+
+        // Receipt dimensions and mesh resolution
+        const receiptWidth = 0.95;
+        const receiptHeight = 1.8;
+        const segmentsX = 32;
+        const segmentsY = 44;
+
+        // Particle for Verlet simulation
+        class Particle {
+          constructor(x, y, z, pinned = false) {
+            this.position = new THREE.Vector3(x, y, z); // Current position
+            this.previous = new THREE.Vector3(x, y, z); // Previous position (for velocity)
+            this.acceleration = new THREE.Vector3(); // Accumulated forces
+            this.pinned = pinned; // Whether it is fixed
+          }
+          addForce(force) {
+            this.acceleration.add(force); // Add force vector
+          }
+          integrate(dt, damping) {
+            if (this.pinned) {
+              this.position.copy(this.previous); // Keep pinned in place
+              this.acceleration.set(0, 0, 0); // Clear forces
+              return;
+            }
+            // Verlet integration: newPos = pos + (pos - prev) * damping + accel * dt^2
+            const velocity = this.position.clone().sub(this.previous).multiplyScalar(damping);
+            const next = this.position.clone().add(velocity).addScaledVector(this.acceleration, dt * dt);
+            this.previous.copy(this.position);
+            this.position.copy(next);
+            this.acceleration.set(0, 0, 0);
+          }
+          pinTo(pos) {
+            this.position.copy(pos);
+            this.previous.copy(pos);
+          }
+        }
+
+        // Distance constraint between particles
+        class Constraint {
+          constructor(p1, p2, rest) {
+            this.p1 = p1;
+            this.p2 = p2;
+            this.rest = rest;
+          }
+          satisfy() {
+            const diff = this.p2.position.clone().sub(this.p1.position);
+            const dist = diff.length() || 1e-6;
+            const correction = diff.multiplyScalar((dist - this.rest) / dist);
+            const half = correction.multiplyScalar(0.5);
+            if (!this.p1.pinned) this.p1.position.add(half);
+            if (!this.p2.pinned) this.p2.position.sub(half);
+          }
+        }
+
+        // Arrays for the cloth sim
+        const particles = [];
+        const constraints = [];
+
+        // Grid origin and spacing
+        const startX = -receiptWidth / 2;
+        const startY = receiptHeight / 2;
+        const dx = receiptWidth / segmentsX;
+        const dy = receiptHeight / segmentsY;
+
+        // Create particles in a grid
+        for (let y = 0; y <= segmentsY; y++) {
+          for (let x = 0; x <= segmentsX; x++) {
+            const px = startX + x * dx;
+            const py = startY - y * dy;
+            const pz = 0;
+            const pinned = y === 0; // Entire top edge pinned
+            particles.push(new Particle(px, py, pz, pinned));
+          }
+        }
+
+        // Helper to index into the particle array
+        const idx = (x, y) => y * (segmentsX + 1) + x;
+
+        // Create constraints (structural + shear + bend)
+        for (let y = 0; y <= segmentsY; y++) {
+          for (let x = 0; x <= segmentsX; x++) {
+            if (x < segmentsX) {
+              const p1 = particles[idx(x, y)];
+              const p2 = particles[idx(x + 1, y)];
+              constraints.push(new Constraint(p1, p2, dx));
+            }
+            if (y < segmentsY) {
+              const p1 = particles[idx(x, y)];
+              const p2 = particles[idx(x, y + 1)];
+              constraints.push(new Constraint(p1, p2, dy));
+            }
+            if (x < segmentsX && y < segmentsY) {
+              const p1 = particles[idx(x, y)];
+              const p2 = particles[idx(x + 1, y + 1)];
+              const p3 = particles[idx(x + 1, y)];
+              const p4 = particles[idx(x, y + 1)];
+              constraints.push(new Constraint(p1, p2, Math.hypot(dx, dy)));
+              constraints.push(new Constraint(p3, p4, Math.hypot(dx, dy)));
+            }
+            if (x < segmentsX - 1) {
+              const p1 = particles[idx(x, y)];
+              const p2 = particles[idx(x + 2, y)];
+              constraints.push(new Constraint(p1, p2, dx * 2));
+            }
+            if (y < segmentsY - 1) {
+              const p1 = particles[idx(x, y)];
+              const p2 = particles[idx(x, y + 2)];
+              constraints.push(new Constraint(p1, p2, dy * 2));
+            }
+          }
+        }
+
+        // Build the plane geometry
+        const receiptGeom = new THREE.PlaneGeometry(
+          receiptWidth,
+          receiptHeight,
+          segmentsX,
+          segmentsY
+        );
+
+        // Build the receipt texture on a canvas
+        const texture = (() => {
+          const c = document.createElement("canvas");
+          c.width = 512;
+          c.height = 1100;
+          const ctx = c.getContext("2d");
+
+          // Base paper color
+          ctx.fillStyle = "#fffefb";
+          ctx.fillRect(0, 0, c.width, c.height);
+
+          // Add subtle noise
+          const noise = ctx.createImageData(c.width, c.height);
+          for (let i = 0; i < noise.data.length; i += 4) {
+            const v = 250 + Math.random() * 4;
+            noise.data[i] = v;
+            noise.data[i + 1] = v - 1;
+            noise.data[i + 2] = v - 2;
+            noise.data[i + 3] = 20;
+          }
+          ctx.putImageData(noise, 0, 0);
+
+          // Header text
+          ctx.fillStyle = "#2b2b2b";
+          ctx.font = "28px 'Courier New', monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("GROCERY", c.width / 2, 70);
+
+          // Items
+          ctx.font = "21px 'Courier New', monospace";
+          ctx.textAlign = "left";
+          const lines = [
+            "1  Ramen                     $9.99",
+            "1  Oats                      $4.25",
+            "2  lights                    $6.40",
+            "1  Flakes                    $3.75",
+            "1  PBR Pickles               $2.50",
+            "1  Cup Noodles               $5.60",
+            "1  Mapper Syrup              $3.15",
+            "1  Blueberries               $4.10",
+            "1  Dumplings                 $7.20",
+            "1  Apple                     $2.80",
+            "1  Snacks                    $5.55",
+            "1  Veggies                   $6.00",
+            "1  Gummies                   $3.30",
+          ];
+          let y = 140;
+          for (const line of lines) {
+            ctx.fillText(line, 32, y);
+            y += 46;
+          }
+          ctx.fillText("------------------------------", 32, y + 10);
+          ctx.fillText("TOTAL:                       64.59", 32, y + 55);
+          ctx.fillText("PAID WITH:   CASH", 32, y + 100);
+          ctx.fillText("THANK YOU FOR RENDERING!", 32, y + 150);
+          // Barcode (decorative, not scannable)
+          const bcX = 40;
+          const bcY = y + 170;
+          const bcW = c.width - 80;
+          const bcH = 70;
+          ctx.fillStyle = "#1f1f1f";
+
+          // Draw alternating bars with slight randomness
+          let x = bcX;
+          while (x < bcX + bcW) {
+            const w = Math.random() > 0.6 ? 3 : 2;
+            ctx.fillRect(x, bcY, w, bcH);
+            x += w + 1;
+          }
+
+          // Barcode label text
+          ctx.font = "18px 'Courier New', monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("0 12345 67890 5", c.width / 2, bcY + bcH + 26);
+
+          // Red rectangle
+          ctx.globalAlpha = 0.18;
+          ctx.strokeStyle = "#d23d2a";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(20, 112, c.width - 40, 650);
+          ctx.globalAlpha = 1;
+
+          // Turn into a Three.js texture
+          const tex = new THREE.CanvasTexture(c);
+          tex.anisotropy = 8;
+          tex.wrapS = THREE.ClampToEdgeWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          return tex;
+        })();
+
+        // Receipt material
+        const receiptMat = new THREE.MeshStandardMaterial({
+          color: 0xfffefb,
+          roughness: 0.8,
+          metalness: 0.0,
+          map: texture,
+          side: THREE.DoubleSide,
+        });
+
+        // Receipt mesh
+        const receiptMesh = new THREE.Mesh(receiptGeom, receiptMat);
+        receiptMesh.castShadow = false;
+        receiptMesh.receiveShadow = false;
+        scene.add(receiptMesh);
+
+        // Fit camera to receipt height
+        const fitCameraToReceipt = () => {
+          const margin = 1.35;
+          const fovRad = THREE.MathUtils.degToRad(camera.fov);
+          const dist = (receiptHeight * margin) / (2 * Math.tan(fovRad / 2));
+          camera.position.z = dist;
+          camera.position.y = 0;
+          camera.lookAt(0, 0, 0);
+        };
+        fitCameraToReceipt();
+
+        // Raycasting for drag interaction
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let grabbed = null;
+        let grabPlane = new THREE.Plane();
+        let grabOffset = new THREE.Vector3();
+
+        // Pointer down: pick a particle
+        const onPointerDown = (event) => {
+          if (event.button !== 0) return; // Left click only
+          mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+          mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+          raycaster.setFromCamera(mouse, camera);
+          const hits = raycaster.intersectObject(receiptMesh);
+          if (!hits.length || !hits[0].uv) return;
+          const uv = hits[0].uv;
+          const ix = Math.round(uv.x * segmentsX);
+          const iy = Math.round((1 - uv.y) * segmentsY);
+          const p = particles[idx(ix, iy)];
+          if (p.pinned) return;
+          grabbed = p;
+          grabPlane.setFromNormalAndCoplanarPoint(
+            camera.getWorldDirection(new THREE.Vector3()),
+            p.position
+          );
+          const intersection = new THREE.Vector3();
+          raycaster.ray.intersectPlane(grabPlane, intersection);
+          grabOffset.copy(intersection).sub(p.position);
+        };
+
+        // Pointer move: drag the particle
+        const onPointerMove = (event) => {
+          if (!grabbed) return;
+          mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+          mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+          raycaster.setFromCamera(mouse, camera);
+          const intersection = new THREE.Vector3();
+          if (raycaster.ray.intersectPlane(grabPlane, intersection)) {
+            intersection.sub(grabOffset);
+            grabbed.position.copy(intersection);
+            grabbed.previous.copy(intersection);
+          }
+        };
+
+        // Pointer up: release the particle
+        const onPointerUp = () => {
+          grabbed = null;
+        };
+
+        // Attach pointer events
+        window.addEventListener("pointerdown", onPointerDown);
+        window.addEventListener("pointermove", onPointerMove);
+        window.addEventListener("pointerup", onPointerUp);
+        window.addEventListener("pointerleave", onPointerUp);
+
+        // Forces
+        const gravity = new THREE.Vector3(0, -9.8, 0);
+        const windDir = new THREE.Vector3(0.15, 0, 0.15);
+        let time = 0;
+
+        // Update the mesh geometry from particles
+        const tempVec = new THREE.Vector3();
+        const updateGeometry = () => {
+          const pos = receiptGeom.attributes.position;
+          for (let y = 0; y <= segmentsY; y++) {
+            for (let x = 0; x <= segmentsX; x++) {
+              const p = particles[idx(x, y)].position;
+              const i = idx(x, y);
+              pos.setXYZ(i, p.x, p.y, p.z);
+            }
+          }
+          pos.needsUpdate = true;
+          receiptGeom.computeVertexNormals();
+        };
+
+        // Keep top edge straight
+        const pinTopEdge = () => {
+          for (let x = 0; x <= segmentsX; x++) {
+            const p = particles[idx(x, 0)];
+            const px = startX + x * dx;
+            const py = startY;
+            p.pinTo(new THREE.Vector3(px, py, 0));
+          }
+        };
+
+        // Main animation loop
+        const animate = () => {
+          requestAnimationFrame(animate);
+          const dt = 1 / 60;
+          time += dt;
+
+          // Wind strength oscillates
+          const windStrength = Math.sin(time * 0.9) * 0.25 + 0.15;
+          tempVec.copy(windDir).multiplyScalar(windStrength);
+
+          // Integrate particles
+          for (const p of particles) {
+            p.addForce(gravity);
+            if (!p.pinned) {
+              p.addForce(tempVec);
+            }
+            p.integrate(dt, 0.98);
+          }
+
+          // Satisfy constraints multiple times for stability
+          for (let i = 0; i < 6; i++) {
+            for (const c of constraints) c.satisfy();
+            pinTopEdge();
+          }
+
+          // Push positions into the mesh
+          updateGeometry();
+          camera.lookAt(0, 0, 0);
+          renderer.render(scene, camera);
+        };
+
+        animate();
+
+        // Resize handling
+        const onResize = () => {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        };
+        window.addEventListener("resize", onResize);
+
+        // Scroll moves the receipt up/down
+        const baseY = receiptHeight * 0.1;
+        const scrollRange = receiptHeight * 0.25;
+        const onScroll = () => {
+          const maxScroll = Math.max(1, document.body.scrollHeight - window.innerHeight);
+          const t = Math.min(1, window.scrollY / maxScroll);
+          camera.position.y = baseY - t * scrollRange;
+          camera.lookAt(0, camera.position.y, 0);
+        };
+        window.addEventListener("scroll", onScroll);
+        onScroll();
+      })();
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+
+
+
